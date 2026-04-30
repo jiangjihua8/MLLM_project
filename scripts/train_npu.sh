@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -euo pipefail
 
 # ============================================================
 # NPU (Ascend) llava training script
@@ -39,32 +39,65 @@ echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>> moxing change finished >>>>>>>>>>>>>>>>>>>>>>
 echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>> Installing dependencies (step.sh) >>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
-# base torch
 pip install torch==2.7.1
+# 重要：先装官方 torch_npu，再覆盖为定制版（环境适配）
 pip install torch_npu==2.7.1rc1
 
-# custom torch_npu whl (environment-specific)
+# 下载并安装定制 torch_npu（根据你的环境必须执行）
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-ads-training-gy1/data/external/personal/w00886412/llm4drive_utils/torch_npu/whl/torch_npu-2.7.1.dev20250724-cp311-cp311-manylinux_2_28_aarch64.whl', '/home/ma-user/torch_npu-2.7.1.dev20250724-cp311-cp311-manylinux_2_28_aarch64.whl')"
-pip install /home/ma-user/torch_npu-2.7.1.dev20250724-cp311-cp311-manylinux_2_28_aarch64.whl
+pip install --force-reinstall /home/ma-user/torch_npu-2.7.1.dev20250724-cp311-cp311-manylinux_2_28_aarch64.whl
 
-# step.sh specified versions
+# -------------------- core ML (step.sh) --------------------
 pip install transformers==4.48.3
-pip install tokenizers==0.22.1
+pip install 'tokenizers>=0.21,<0.22'
 pip install accelerate==1.6.0
 pip install deepspeed==0.14.4
 pip install safetensors
 pip install packaging
 pip install Pillow
+pip install torchvision==0.22.1   # 匹配 torch 2.7.1
 
-# project itself (editable)
-cd "$SCRIPT_DIR"
-pip install -e . 2>/dev/null || pip install -e . --no-deps
-cd -
+# -------------------- llava project dependencies (from pyproject.toml) --------------------
+pip install sentencepiece
+pip install shortuuid
+pip install peft
+pip install pydantic
+pip install 'markdown2[all]'
+pip install 'numpy>=1.26'
+pip install 'scikit-learn>=1.2'
+pip install 'gradio>=5.0'
+pip install requests
+pip install uvicorn
+pip install fastapi
+pip install 'einops>=0.6'
+pip install 'einops-exts>=0.0.4'
+pip install 'timm>=0.9.0'
 
-# compatibility
+# bitsandbytes 跳过（NPU 无 CUDA 量化）
+# pip install bitsandbytes   # 确需量化可 CPU-only 安装
+
+# -------------------- 关键版本锁定，解决 huggingface-hub 冲突 --------------------
+# gradio>=5.0 会拉取 huggingface-hub>=0.25.1（无上限），导致 1.12.0；
+# transformers==4.48.3 要求 <1.0。现强制安装一个兼容版本
+pip install "huggingface-hub>=0.25.1,<1.0" --force-reinstall
+
+# 其他兼容性修补
 pip install urllib3==1.26.15
 
+# -------------------- 最终验证 --------------------
+echo "========== 关键依赖版本验证 =========="
+python -c "import torch; print('torch', torch.__version__)"
+python -c "import torch_npu; print('torch_npu', torch_npu.__version__)"
+python -c "import transformers; print('transformers', transformers.__version__)"
+python -c "import huggingface_hub; print('huggingface-hub', huggingface_hub.__version__)"
+python -c "import accelerate; print('accelerate', accelerate.__version__)"
+python -c "import deepspeed; print('deepspeed', deepspeed.__version__)"
+python -c "import gradio; print('gradio', gradio.__version__)"
+python -c "import timm; print('timm', timm.__version__)"
+echo "========================================"
+
 pip list
+
 echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>> Dependencies installed >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
 
 # ====================== distributed parameters ======================
@@ -113,6 +146,7 @@ export WITHOUT_JIT_COMPILE=1
 export HCCL_OP_BASE_FFTS_MODE_ENABLE=FALSE
 export COMBINED_ENABLE=1
 export OMP_NUM_THREADS=1
+export PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:128
 
 # ====================== output management ======================
 CLUSTER_SAVE=${OUTPUT_URL}
@@ -134,35 +168,48 @@ MODEL_OBS_PATH="obs://yw-ads-training-gy1/data/external/personal/h58801830/whu/j
 DATASET_OBS_PATH="obs://yw-ads-training-gy1/data/external/personal/h58801830/whu/jjh/MLLM20260427_rc_jjh.zip"
 
 DINOV2_PATH=${DINOV2_PATH:-${OBS_CACHE}/checkpoints/facebook_dinov2-large}
-FASTVLM_PATH=${FASTVLM_PATH:-${OBS_CACHE}/checkpoints/llava-fastvithd_7b_stage2}
-DATASET_PATH=${DATASET_PATH:-${OBS_CACHE}/data}
-IMAGE_FOLDER=${IMAGE_FOLDER:-${DATASET_PATH}/img}
+
+FASTVLM_PATH=${FASTVLM_PATH:-${OBS_CACHE}/checkpoints/llava-fastvithd_1.5b_stage2}
+
+DATASET_PATH="/cache/MLLM20260427_rc_jjh"
+IMAGE_FOLDER="${DATASET_PATH}"
+
 
 # ====================== download ======================
 echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>> Downloading models >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
 python -c "import moxing as mox; mox.file.copy_parallel('${MODEL_OBS_PATH}/facebook_dinov2-large', '${DINOV2_PATH}')"
-python -c "import moxing as mox; mox.file.copy_parallel('${MODEL_OBS_PATH}/llava-fastvithd_7b_stage2', '${FASTVLM_PATH}')"
+python -c "import moxing as mox; mox.file.copy_parallel('${MODEL_OBS_PATH}/llava-fastvithd_1.5b_stage2', '${FASTVLM_PATH}')"
 
 echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>> Downloading dataset >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
 python -c "import moxing as mox; mox.file.copy('${DATASET_OBS_PATH}', '${OBS_CACHE}/dataset.zip')"
-cd ${OBS_CACHE}
-unzip -o dataset.zip -d ${DATASET_PATH}
+
+# 直接解压到 /cache，压缩包自带的顶层目录会被保留
+cd /cache
+unzip -o dataset.zip
 cd $SCRIPT_DIR
 
-if [[ -f "${DATASET_PATH}/train.jsonl" ]]; then
-    TRAIN_PATH="${DATASET_PATH}/train.jsonl"
-else
-    echo "ERROR: train.jsonl not found under ${DATASET_PATH}"
+# 检查解压后的目录是否存在
+if [ ! -d "$DATASET_PATH" ]; then
+    echo "ERROR: Expected dataset directory $DATASET_PATH not found after unzip."
+    echo "Listing /cache:"
+    ls -l /cache/
+    exit 1
+fi
+
+TRAIN_PATH="${DATASET_PATH}/train.jsonl"
+if [ ! -f "$TRAIN_PATH" ]; then
+    echo "ERROR: $TRAIN_PATH not found"
+    exit 1
+fi
+
+if [ ! -d "$IMAGE_FOLDER" ]; then
+    echo "ERROR: Image folder $IMAGE_FOLDER not found"
     exit 1
 fi
 
 echo "DATASET_PATH: $DATASET_PATH"
 echo "TRAIN_PATH: $TRAIN_PATH"
 echo ">>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> finish moxing >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>"
-
-# ====================== DeepSpeed config ======================
-DEEPSPEED_CONFIG=${DEEPSPEED_CONFIG:-configs/deepspeed_zero3.json}
-echo ">>> DeepSpeed config: ${DEEPSPEED_CONFIG}"
 
 # ====================== auto gradient accumulation ======================
 tar_equal_batch_size=128
@@ -223,6 +270,8 @@ torchrun \
     --save_total_limit 10 \
     --logging_steps 10 \
     --report_to none \
-    --deepspeed "${DEEPSPEED_CONFIG}"
+    --ddp_find_unused_parameters False \
+    --ddp_backend hccl 
+
 
 echo "=== Training finished ==="
