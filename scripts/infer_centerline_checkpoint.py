@@ -171,7 +171,7 @@ def _load_full_finetune_model(checkpoint_dir: Path, device: str):
     if unexpected:
         print(f"[WARN] Unexpected keys after full-finetune load: {unexpected[:20]}")
 
-    dtype = torch.float16 if device in ("cuda", "npu") else torch.float32
+    dtype = torch.float16 if str(device).startswith(("cuda", "npu")) else torch.float32
     model = model.to(dtype=dtype)
     model = model.to(device)
     model.eval()
@@ -190,7 +190,7 @@ def load_model_components(checkpoint_dir: Path, manifest: dict, device: str):
         model_path=str(checkpoint_dir),
         model_base=model_base,
         model_name=model_name,
-        device_map="auto" if device in ("cuda", "npu") else {"": device},
+        device_map="auto" if str(device).startswith(("cuda", "npu")) else {"": device},
         device=device,
     )
     model.eval()
@@ -221,12 +221,24 @@ def sanitize_filename(name: str) -> str:
 
 
 def main():
+    # ---- 多卡分布式初始化 ----
+    import os
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", -1)))
+    if local_rank >= 0:
+        backend = "hccl" if hasattr(torch, 'npu') and torch.npu.is_available() else "nccl"
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend=backend)
+        device_str = f"npu:{local_rank}" if hasattr(torch, 'npu') and torch.npu.is_available() else f"cuda:{local_rank}"
+    else:
+        device_str = "npu" if hasattr(torch, 'npu') and torch.npu.is_available() else "cuda"
+    # ---- 多卡分布式初始化结束 ----
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--image", default="")
     parser.add_argument("--test-json", default="")
     parser.add_argument("--image-folder", default="")
-    parser.add_argument("--num-samples", type=int, default=1)
+    parser.add_argument("--num-samples", type=int, default=-1)
     parser.add_argument("--sample-offset", type=int, default=0)
     parser.add_argument("--prompt-mode", choices=["default", "dataset"], default="default")
     parser.add_argument("--conv-template", default="")
@@ -238,6 +250,7 @@ def main():
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--print-full-output", action="store_true")
     args = parser.parse_args()
+    args.device = device_str
 
     checkpoint_dir = Path(args.checkpoint_dir)
     manifest = read_manifest(checkpoint_dir)
@@ -263,8 +276,10 @@ def main():
         if not args.image_folder:
             raise ValueError("--image-folder is required when using --test-json")
         start = max(0, args.sample_offset)
-        end = start + max(1, args.num_samples)
+        end = start + (args.num_samples if args.num_samples > 0 else len(records) - start)
         records = records[start:end]
+        if torch.distributed.is_initialized():
+            records = records[torch.distributed.get_rank()::torch.distributed.get_world_size()]
     else:
         if not args.image:
             raise ValueError("Provide either --image or --test-json")
@@ -383,6 +398,10 @@ def main():
             print("NORMALIZED_PREDICTION_START")
             print(prediction)
             print("NORMALIZED_PREDICTION_END")
+
+    if torch.distributed.is_initialized() and args.output_json:
+        base = args.output_json.rsplit(".", 1)[0]
+        args.output_json = f"{base}_rank{torch.distributed.get_rank()}.json"
 
     if args.output_json:
         Path(args.output_json).write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
