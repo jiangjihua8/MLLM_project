@@ -20,6 +20,7 @@ import copy
 import random
 import shutil
 import time
+from datetime import datetime
 from dataclasses import dataclass, field
 import json
 import logging
@@ -58,6 +59,8 @@ class JsonlMetricLoggerCallback(TrainerCallback):
         self.train_log_path = os.path.join(output_dir, "train_metrics.jsonl")
         self.eval_log_path = os.path.join(output_dir, "eval_metrics.jsonl")
         self.checkpoint_log_path = os.path.join(output_dir, "checkpoint_events.jsonl")
+        self._throughput_start_time = None
+        self._throughput_start_step = 0
 
     def _is_rank0(self, args) -> bool:
         return args.local_rank in (-1, 0)
@@ -86,12 +89,32 @@ class JsonlMetricLoggerCallback(TrainerCallback):
         if not self._is_rank0(args) or not logs:
             return
 
+        throughput_str = None
+        if self._throughput_start_time is None:
+            self._throughput_start_time = time.time()
+            self._throughput_start_step = state.global_step
+        else:
+            step_diff = state.global_step - self._throughput_start_step
+            time_diff = time.time() - self._throughput_start_time
+            if step_diff > 0 and time_diff > 0:
+                per_device_bs = getattr(args, 'per_device_train_batch_size', 1)
+                gas = getattr(args, 'gradient_accumulation_steps', 1)
+                n_gpus = max(1, getattr(args, 'world_size', 1))
+                max_len = getattr(args, 'model_max_length', 4096)
+                total_tokens = per_device_bs * gas * step_diff * max_len
+                throughput = total_tokens / time_diff / n_gpus
+                throughput_str = f"{throughput:.2f} tokens/s/npu"
+            self._throughput_start_time = time.time()
+            self._throughput_start_step = state.global_step
+
         payload = {
-            "time": time.time(),
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "global_step": state.global_step,
             "epoch": state.epoch,
             **logs,
         }
+        if throughput_str:
+            payload["DI_throughput"] = throughput_str
 
         if "eval_loss" in logs or any(key.startswith("eval_") for key in logs):
             self._append_jsonl(self.eval_log_path, payload)
