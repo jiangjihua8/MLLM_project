@@ -56,9 +56,9 @@ def rank0_print(*args):
 class JsonlMetricLoggerCallback(TrainerCallback):
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
-        self.train_log_path = os.path.join(output_dir, "train_metrics.jsonl")
-        self.eval_log_path = os.path.join(output_dir, "eval_metrics.jsonl")
-        self.checkpoint_log_path = os.path.join(output_dir, "checkpoint_events.jsonl")
+        self.train_log_path = os.path.join(output_dir, "train_metrics.log")
+        self.eval_log_path = os.path.join(output_dir, "eval_metrics.log")
+        self.checkpoint_log_path = os.path.join(output_dir, "checkpoint_events.log")
         self._throughput_start_time = None
         self._throughput_start_step = 0
 
