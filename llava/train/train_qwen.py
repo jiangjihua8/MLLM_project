@@ -1233,7 +1233,9 @@ def train(attn_implementation=None):
             if _is_qwen3:
                 from llava.model.language_model.llava_qwen3 import LlavaQwen3ConfigWrapper
                 if not isinstance(config, LlavaQwen3ConfigWrapper):
-                    config = LlavaQwen3ConfigWrapper(**config.to_dict())
+                    d = config.to_dict()
+                    d.pop("model_type", None)
+                    config = LlavaQwen3ConfigWrapper(**d)
                 model = LlavaQwen3ForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
                     config=config,
@@ -1245,7 +1247,9 @@ def train(attn_implementation=None):
             else:
                 from llava.model.language_model.llava_qwen import LlavaConfig
                 if not isinstance(config, LlavaConfig):
-                    config = LlavaConfig(**config.to_dict())
+                    d = config.to_dict()
+                    d.pop("model_type", None)
+                    config = LlavaConfig(**d)
                 model = LlavaQwen2ForCausalLM.from_pretrained(
                     model_args.model_name_or_path,
                     config=config,
