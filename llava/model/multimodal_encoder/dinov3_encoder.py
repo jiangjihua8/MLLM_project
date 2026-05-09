@@ -4,20 +4,10 @@ import torch.nn as nn
 from transformers import AutoImageProcessor
 from transformers import DINOv3ViTConfig, DINOv3ViTModel
 
-from .deepstack import build_deepstack_mergers
+from .deepstack import DeepStack
 
 
 class DINOv3VisionTower(nn.Module):
-    """
-    DINOv3 ViT vision encoder.
-
-    Key differences from DINOv2:
-      - Uses DINOv3ViTModel (separate HF model class)
-      - patch_size=16 (vs DINOv2's 14)
-      - Has 4 register tokens (CLS + 4 register + N patches)
-      - Uses RoPE instead of absolute position embeddings
-      - No 'encoder.layer' attribute; layers accessed via hidden_states list
-    """
     def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
 
@@ -29,7 +19,7 @@ class DINOv3VisionTower(nn.Module):
         self.input_image_size = getattr(args, 'input_image_size', None)
 
         self.deepstack_visual_indexes = getattr(args, 'deepstack_visual_indexes', None)
-        self.deepstack_mergers = None
+        self.deepstack = None
 
         if self.tune_vision_tower:
             print("DINOv3 vision tower is set to tunable")
@@ -65,56 +55,42 @@ class DINOv3VisionTower(nn.Module):
             if hasattr(self.image_processor, 'crop_size'):
                 self.image_processor.crop_size = {"height": target_size, "width": target_size}
 
-        self.num_layers = self.vision_tower.config.num_hidden_layers
-        self.num_register_tokens = self.vision_tower.config.num_register_tokens
-        self.skip_tokens = 1 + self.num_register_tokens  # CLS + register tokens
+        self._target_size = target_size
+        self.skip_tokens = 1 + self.vision_tower.config.num_register_tokens
 
         if self.deepstack_visual_indexes is not None:
             self._build_deepstack()
 
+        self.cfg_only = self.vision_tower.config
         self.is_loaded = True
 
     def _build_deepstack(self):
-        vit_hidden_size = self.vision_tower.config.hidden_size
-        self.deepstack_mergers = build_deepstack_mergers(
-            vit_hidden_size=vit_hidden_size,
-            llm_hidden_size=vit_hidden_size,
-            num_mergers=len(self.deepstack_visual_indexes),
-        )
-        print(f"DeepStack (real injection) enabled: ViT layers={self.deepstack_visual_indexes}, "
-              f"num={len(self.deepstack_visual_indexes)}, main_layer={self.select_layer}")
-
-    def set_llm_hidden_size(self, llm_hidden_size):
-        if self.deepstack_mergers is not None:
-            vit_hidden_size = self.vision_tower.config.hidden_size
-            self.deepstack_mergers = build_deepstack_mergers(
-                vit_hidden_size=vit_hidden_size,
-                llm_hidden_size=llm_hidden_size,
-                num_mergers=len(self.deepstack_visual_indexes),
-            )
+        num_layers = len(self.deepstack_visual_indexes)
+        hidden_size = self.vision_tower.config.hidden_size
+        self.deepstack = DeepStack(hidden_size, num_layers)
+        print(f"DeepStack enabled: layers={self.deepstack_visual_indexes}, "
+              f"num_selected={num_layers}, hidden_size={hidden_size}")
 
     def feature_select(self, image_forward_outs):
         hidden_states = image_forward_outs.hidden_states
+        if self.deepstack is not None:
+            selected = [hidden_states[i] for i in self.deepstack_visual_indexes]
+            if self.select_feature == 'patch':
+                selected = [hs[:, self.skip_tokens:] for hs in selected]
+            elif self.select_feature == 'cls_patch':
+                pass
+            else:
+                raise ValueError(f'Unexpected select feature: {self.select_feature}')
+            return self.deepstack(selected)
 
-        main_features = hidden_states[self.select_layer]
+        image_features = hidden_states[self.select_layer]
         if self.select_feature == 'patch':
-            main_features = main_features[:, self.skip_tokens:]
+            image_features = image_features[:, self.skip_tokens:]
         elif self.select_feature == 'cls_patch':
-            pass
+            image_features = image_features
         else:
             raise ValueError(f'Unexpected select feature: {self.select_feature}')
-
-        if self.deepstack_mergers is not None:
-            deepstack_features = []
-            for i, idx in enumerate(self.deepstack_visual_indexes):
-                idx = min(idx, self.num_layers)
-                hs = hidden_states[idx]
-                if self.select_feature == 'patch':
-                    hs = hs[:, self.skip_tokens:]
-                deepstack_features.append(self.deepstack_mergers[i](hs))
-            return main_features, deepstack_features
-
-        return main_features, None
+        return image_features
 
     def forward(self, images):
         if self.tune_vision_tower:
@@ -124,30 +100,22 @@ class DINOv3VisionTower(nn.Module):
 
     def forward_images(self, images):
         if type(images) is list:
-            main_features = []
-            deepstack_features = None
+            image_features = []
             for image in images:
                 image_forward_out = self.vision_tower(
                     image.to(device=self.device, dtype=self.dtype).unsqueeze(0),
                     output_hidden_states=True,
                 )
-                mf, df = self.feature_select(image_forward_out)
-                mf = mf.to(image.dtype)
-                main_features.append(mf)
-                if df is not None:
-                    if deepstack_features is None:
-                        deepstack_features = [[] for _ in range(len(df))]
-                    for j, d in enumerate(df):
-                        deepstack_features[j].append(d.to(image.dtype))
-            if deepstack_features is not None:
-                deepstack_features = [torch.cat(dlist, dim=0) for dlist in deepstack_features]
-            return main_features[0] if len(main_features) == 1 else main_features, deepstack_features
+                image_feature = self.feature_select(image_forward_out).to(image.dtype)
+                image_features.append(image_feature)
+        else:
+            image_forward_outs = self.vision_tower(
+                images.to(device=self.device, dtype=self.dtype),
+                output_hidden_states=True,
+            )
+            image_features = self.feature_select(image_forward_outs).to(images.dtype)
 
-        image_forward_outs = self.vision_tower(
-            images.to(device=self.device, dtype=self.dtype),
-            output_hidden_states=True,
-        )
-        return self.feature_select(image_forward_outs)
+        return image_features
 
     @property
     def dummy_feature(self):
@@ -162,13 +130,19 @@ class DINOv3VisionTower(nn.Module):
         return self.vision_tower.device
 
     @property
+    def config(self):
+        if self.is_loaded:
+            return self.vision_tower.config
+        return self.cfg_only
+
+    @property
     def hidden_size(self):
-        return self.vision_tower.config.hidden_size
+        return self.config.hidden_size
 
     @property
     def num_patches_per_side(self):
-        return self.vision_tower.config.image_size // self.vision_tower.config.patch_size
+        return self._target_size // self.config.patch_size
 
     @property
     def num_patches(self):
-        return (self.vision_tower.config.image_size // self.vision_tower.config.patch_size) ** 2
+        return (self._target_size // self.config.patch_size) ** 2
