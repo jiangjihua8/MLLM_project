@@ -1,15 +1,22 @@
 import torch
 import torch.nn as nn
 
-from transformers import AutoConfig, AutoImageProcessor, Dinov2Model
+from transformers import AutoImageProcessor
+from transformers import DINOv3ViTConfig, DINOv3ViTModel
 
 from .deepstack import build_deepstack_mergers
 
 
 class DINOv3VisionTower(nn.Module):
     """
-    DINOv3 vision encoder — same Dinov2Model architecture, different pretrained weights.
-    Uses the same HuggingFace Dinov2Model class for loading.
+    DINOv3 ViT vision encoder.
+
+    Key differences from DINOv2:
+      - Uses DINOv3ViTModel (separate HF model class)
+      - patch_size=16 (vs DINOv2's 14)
+      - Has 4 register tokens (CLS + 4 register + N patches)
+      - Uses RoPE instead of absolute position embeddings
+      - No 'encoder.layer' attribute; layers accessed via hidden_states list
     """
     def __init__(self, vision_tower, args, delay_load=False):
         super().__init__()
@@ -23,7 +30,6 @@ class DINOv3VisionTower(nn.Module):
 
         self.deepstack_visual_indexes = getattr(args, 'deepstack_visual_indexes', None)
         self.deepstack_mergers = None
-        self._deepstack_llm_hidden = None
 
         if self.tune_vision_tower:
             print("DINOv3 vision tower is set to tunable")
@@ -33,7 +39,7 @@ class DINOv3VisionTower(nn.Module):
         elif self.tune_vision_tower:
             self.load_model()
         else:
-            self.cfg_only = AutoConfig.from_pretrained(self.vision_tower_name, local_files_only=True)
+            self.cfg_only = DINOv3ViTConfig.from_pretrained(self.vision_tower_name, local_files_only=True)
             if self.input_image_size is not None:
                 self.cfg_only.image_size = self.input_image_size
 
@@ -43,7 +49,7 @@ class DINOv3VisionTower(nn.Module):
             return
 
         self.image_processor = AutoImageProcessor.from_pretrained(self.vision_tower_name, local_files_only=True)
-        self.vision_tower = Dinov2Model.from_pretrained(
+        self.vision_tower = DINOv3ViTModel.from_pretrained(
             self.vision_tower_name,
             device_map=device_map,
             local_files_only=True,
@@ -54,25 +60,19 @@ class DINOv3VisionTower(nn.Module):
         target_size = self.input_image_size or self.vision_tower.config.image_size
         if target_size is not None:
             print(f"Using DINOv3 input image size: {target_size}")
-            self.image_processor.size = {"shortest_edge": target_size}
-            self.image_processor.crop_size = {"height": target_size, "width": target_size}
+            if hasattr(self.image_processor, 'size'):
+                self.image_processor.size = {"shortest_edge": target_size}
+            if hasattr(self.image_processor, 'crop_size'):
+                self.image_processor.crop_size = {"height": target_size, "width": target_size}
 
-        self.num_layers = len(self.vision_tower.encoder.layer)
-        self._resolve_select_layer_index()
+        self.num_layers = self.vision_tower.config.num_hidden_layers
+        self.num_register_tokens = self.vision_tower.config.num_register_tokens
+        self.skip_tokens = 1 + self.num_register_tokens  # CLS + register tokens
 
         if self.deepstack_visual_indexes is not None:
             self._build_deepstack()
 
-        self.cfg_only = self.vision_tower.config
         self.is_loaded = True
-
-    def _resolve_select_layer_index(self):
-        raw = self.select_layer
-        if raw >= 0:
-            self.select_layer_idx = raw
-        else:
-            self.select_layer_idx = self.num_layers + raw
-        self.select_layer_idx = max(0, min(self.select_layer_idx, self.num_layers - 1))
 
     def _build_deepstack(self):
         vit_hidden_size = self.vision_tower.config.hidden_size
@@ -82,7 +82,7 @@ class DINOv3VisionTower(nn.Module):
             num_mergers=len(self.deepstack_visual_indexes),
         )
         print(f"DeepStack (real injection) enabled: ViT layers={self.deepstack_visual_indexes}, "
-              f"num={len(self.deepstack_visual_indexes)}, main_layer={self.select_layer_idx}")
+              f"num={len(self.deepstack_visual_indexes)}, main_layer={self.select_layer}")
 
     def set_llm_hidden_size(self, llm_hidden_size):
         if self.deepstack_mergers is not None:
@@ -96,9 +96,9 @@ class DINOv3VisionTower(nn.Module):
     def feature_select(self, image_forward_outs):
         hidden_states = image_forward_outs.hidden_states
 
-        main_features = hidden_states[self.select_layer_idx]
+        main_features = hidden_states[self.select_layer]
         if self.select_feature == 'patch':
-            main_features = main_features[:, 1:]
+            main_features = main_features[:, self.skip_tokens:]
         elif self.select_feature == 'cls_patch':
             pass
         else:
@@ -107,10 +107,10 @@ class DINOv3VisionTower(nn.Module):
         if self.deepstack_mergers is not None:
             deepstack_features = []
             for i, idx in enumerate(self.deepstack_visual_indexes):
-                idx = min(idx, self.num_layers - 1)
+                idx = min(idx, self.num_layers)
                 hs = hidden_states[idx]
                 if self.select_feature == 'patch':
-                    hs = hs[:, 1:]
+                    hs = hs[:, self.skip_tokens:]
                 deepstack_features.append(self.deepstack_mergers[i](hs))
             return main_features, deepstack_features
 
@@ -162,19 +162,13 @@ class DINOv3VisionTower(nn.Module):
         return self.vision_tower.device
 
     @property
-    def config(self):
-        if self.is_loaded:
-            return self.vision_tower.config
-        return self.cfg_only
-
-    @property
     def hidden_size(self):
-        return self.config.hidden_size
+        return self.vision_tower.config.hidden_size
 
     @property
     def num_patches_per_side(self):
-        return self.config.image_size // self.config.patch_size
+        return self.vision_tower.config.image_size // self.vision_tower.config.patch_size
 
     @property
     def num_patches(self):
-        return (self.config.image_size // self.config.patch_size) ** 2
+        return (self.vision_tower.config.image_size // self.vision_tower.config.patch_size) ** 2
