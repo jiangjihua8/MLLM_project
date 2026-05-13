@@ -16,7 +16,7 @@ This branch supports:
 - Training with or without DeepStack.
 - LoRA and full-parameter checkpoint loading.
 - Inference that recovers DeepStack settings from checkpoint metadata.
-- Rank-0-only clean training logs with `DI_throughput: ... tokens/s/npu`.
+- Rank-0-only training, eval, and checkpoint metric files with `DI_throughput: ... tokens/s/npu`.
 
 ## Documentation
 
@@ -67,18 +67,20 @@ shape alignment passed
 no UNEXPECTED vision-weight load warning
 ```
 
-## Training Console Log
+## Training Logs
 
-The training console prints only step metrics, for example:
+The training console uses the Hugging Face Trainer default progress and metric output. `DI_throughput` is not injected into the console output.
 
-```text
-time: 2026-05-13 15:43:14  global_step: 1  epoch: 1  loss: 1.23  learning_rate: 2e-05  DI_throughput: 12716.48 tokens/s/npu
-```
-
-Final runtime summaries and checkpoint events are written to log files only:
+Throughput and runtime metrics are written to log files:
 
 ```text
 train_metrics.log
 eval_metrics.log
 checkpoint_events.log
+```
+
+Example `train_metrics.log` line:
+
+```text
+time: 2026-05-13 15:43:14  global_step: 1  epoch: 1  loss: 1.23  learning_rate: 2e-05  DI_throughput: 12716.48 tokens/s/npu
 ```

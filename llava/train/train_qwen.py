@@ -37,7 +37,6 @@ from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 from transformers import TrainerCallback
-from transformers.trainer_callback import PrinterCallback, ProgressCallback
 
 from llava import conversation as conversation_lib
 from llava.model import *
@@ -198,13 +197,10 @@ class JsonlMetricLoggerCallback(TrainerCallback):
         if throughput_str:
             payload["DI_throughput"] = throughput_str
 
-        is_train_runtime_summary = "train_runtime" in logs
         if "eval_loss" in logs or any(key.startswith("eval_") for key in logs):
-            line = self._append_log_line(self.eval_log_path, payload)
+            self._append_log_line(self.eval_log_path, payload)
         else:
-            line = self._append_log_line(self.train_log_path, payload)
-        if not is_train_runtime_summary:
-            print(line)
+            self._append_log_line(self.train_log_path, payload)
 
     def on_save(self, args, state, control, **kwargs):
         if not self._is_rank0(args, state):
@@ -1597,8 +1593,6 @@ def train(attn_implementation=None):
                            args=training_args,
                            callbacks=[JsonlMetricLoggerCallback(training_args.output_dir)],
                            **data_module)
-    trainer.remove_callback(PrinterCallback)
-    trainer.remove_callback(ProgressCallback)
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

@@ -160,19 +160,17 @@ Normal stdout is rank-0 only by default:
 LLAVA_LOG_RANK0_ONLY=1
 ```
 
-The console prints only step metrics:
+The console uses the Hugging Face Trainer default progress and metric output. It is intentionally kept close to the upstream Trainer behavior because it is easier to read during long runs.
+
+`DI_throughput` is not injected into the console output. It is written to `train_metrics.log`.
+
+Example `train_metrics.log` step line:
 
 ```text
 time: 2026-05-13 15:43:14  global_step: 1  epoch: 1  loss: 1.23  learning_rate: 2e-05  DI_throughput: 12716.48 tokens/s/npu
 ```
 
-The console does not print Hugging Face dict logs such as:
-
-```text
-{'loss': ...}
-```
-
-The console also does not print checkpoint events or final runtime summaries. These are written to files:
+Checkpoint events and final runtime summaries are also written to files:
 
 ```text
 train_metrics.log
