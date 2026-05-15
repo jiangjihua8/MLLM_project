@@ -13,7 +13,12 @@ from transformers.trainer import (
     # ALL_LAYERNORM_LAYERS,
     logger,
 )
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from typing import List, Optional
+from llava.train.checkpoint_metadata import (
+    sync_qwen_multimodal_config,
+    write_qwen_multimodal_checkpoint_metadata,
+)
 from llava.model.qwen_token_utils import sync_qwen_token_config
 
 
@@ -243,13 +248,13 @@ class LLaVATrainer(Trainer):
         return self.optimizer
 
     def _save_checkpoint(self, model, trial, metrics=None):
+        checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
+        run_dir = self._get_output_dir(trial=trial)
+        output_dir = os.path.join(run_dir, checkpoint_folder)
+
+        sync_qwen_multimodal_config(self.model)
+
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
-            from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
-            checkpoint_folder = f"{PREFIX_CHECKPOINT_DIR}-{self.state.global_step}"
-
-            run_dir = self._get_output_dir(trial=trial)
-            output_dir = os.path.join(run_dir, checkpoint_folder)
-
             # Only save Adapter
             keys_to_match = ['mm_projector', 'vision_resampler']
             if getattr(self.args, "use_im_start_end", False):
@@ -260,6 +265,7 @@ class LLaVATrainer(Trainer):
             if self.is_world_process_zero():
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+                write_qwen_multimodal_checkpoint_metadata(self.model, output_dir, self)
         else:
             # Workaround for the issue: https://github.com/haotian-liu/LLaVA/issues/1144
             if getattr(model, "generation_config", None) is None:
@@ -268,11 +274,14 @@ class LLaVATrainer(Trainer):
             model.generation_config.top_p = None
             sync_qwen_token_config(model=model)
             super(LLaVATrainer, self)._save_checkpoint(model, trial)
+            write_qwen_multimodal_checkpoint_metadata(self.model, output_dir, self)
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):
             pass
         else:
+            output_dir = output_dir if output_dir is not None else self.args.output_dir
+            sync_qwen_multimodal_config(self.model)
             # Workaround for the issue: https://github.com/haotian-liu/LLaVA/issues/1144
             if getattr(self.model, "generation_config", None) is None:
                 self.model.generation_config = transformers.GenerationConfig.from_model_config(self.model.config)
@@ -280,3 +289,4 @@ class LLaVATrainer(Trainer):
             self.model.generation_config.top_p = None
             sync_qwen_token_config(model=self.model)
             super(LLaVATrainer, self)._save(output_dir, state_dict)
+            write_qwen_multimodal_checkpoint_metadata(self.model, output_dir, self)
