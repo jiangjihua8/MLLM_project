@@ -266,6 +266,24 @@ class BestTrainLossCallback(TrainerCallback):
             return best_dir
         return os.path.join(args.output_dir, best_dir)
 
+    def _clear_directory_contents(self, directory):
+        os.makedirs(directory, exist_ok=True)
+        for name in os.listdir(directory):
+            path = os.path.join(directory, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.remove(path)
+
+    def _copy_checkpoint_contents(self, checkpoint_dir, best_dir):
+        for name in os.listdir(checkpoint_dir):
+            src = os.path.join(checkpoint_dir, name)
+            dst = os.path.join(best_dir, name)
+            if os.path.isdir(src) and not os.path.islink(src):
+                shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=True)
+            else:
+                shutil.copy2(src, dst)
+
     def on_train_begin(self, args, state, control, **kwargs):
         if not self._enabled(args) or not self._is_rank0(args, state):
             return
@@ -321,19 +339,13 @@ class BestTrainLossCallback(TrainerCallback):
             return
 
         best_dir = self._best_dir(args)
-        tmp_dir = f"{best_dir}.tmp"
-        if os.path.exists(tmp_dir):
-            shutil.rmtree(tmp_dir)
-        shutil.copytree(checkpoint_dir, tmp_dir, symlinks=True)
+        self._clear_directory_contents(best_dir)
+        self._copy_checkpoint_contents(checkpoint_dir, best_dir)
 
         metadata = dict(self.pending_best)
         metadata["best_checkpoint"] = checkpoint_dir
-        with open(os.path.join(tmp_dir, "best_train_loss.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(best_dir, "best_train_loss.json"), "w", encoding="utf-8") as f:
             json.dump(metadata, f, ensure_ascii=False, indent=2)
-
-        if os.path.exists(best_dir):
-            shutil.rmtree(best_dir)
-        os.replace(tmp_dir, best_dir)
         rank0_print(
             f"Updated best train loss checkpoint: {best_dir} "
             f"(loss={metadata['best_train_loss']:.6g}, step={state.global_step})"
